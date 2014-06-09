@@ -10,6 +10,6 @@ TrafficServer是一款高性能的web反向代理缓存服务器, 一般部署�
 * [Command Reference]
 * [Plugin Reference]
 * [API Reference]
-* [Architecture and Hacking]
-* [Glossary]
+* [架构 & 破解](arch/index.md)
+* [术语]
 
