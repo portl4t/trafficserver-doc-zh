@@ -15,9 +15,18 @@ Apache Traffic Server不仅是HTTP代理服务器, 还是HTTP缓存服务器。T
 #### Cache存储
 Traffic Server使用的裸存储设备定义在配置文件storage.config中。文件中的每一行定义了一个具有一致性存储特征的`cache设备`。
 
-![alter文字](https://docs.trafficserver.apache.org/en/latest/_images/cache-spans.png)
+![Two cache spans](https://docs.trafficserver.apache.org/en/latest/_images/cache-spans.png)
 
 Traffic Server的管理员可以根据实际情况将存储空间组织成一系列分卷，这些分卷定义在volume.config配置文件中, `cache分卷`是管理存储配置的基本单位。
 
-`cache分卷`的容量可以通过存储百分比来定义, 也可以定义为一个绝对的数值。默认情况下，每一个`cache分卷`定义的存储空间都会分散到所有的`cache设备`中，这是出于健壮性的考虑(一个盘有问题不会影响这个`cache分卷`在其他盘上的存储空间)。`cache分卷`和`cache设备`的交集是`cache带`，每个`cache设备`会被切分成若干个`cache带`, 而每个`cache分卷`是由一系列来自不同的`cache设备`中的`cache带`组成。
+`Cache分卷`的容量可以通过存储百分比来定义, 也可以定义为一个绝对的数值。默认情况下，每一个`cache分卷`定义的存储空间都会分散到所有的`cache设备`中，这是出于健壮性的考虑(一个盘有问题不会影响这个`cache分卷`在其他盘上的存储空间)。`cache分卷`和`cache设备`的交集是`cache带`，每个`cache设备`会被切分成若干个`cache带`, 而每个`cache分卷`是由一系列来自不同的`cache设备`中的`cache带`组成。
 
+如果`Cache分卷`按下面这样定义:
+
+![volumes](https://docs.trafficserver.apache.org/en/latest/_images/ats-cache-volume-definition.png)
+
+那么对于前面定义的`Cache设备`的实际布局将会如下所示:
+
+![layout](https://docs.trafficserver.apache.org/en/latest/_images/cache-span-layout.png)
+
+`Cache带`是cache设计实现过程中的最基本的单位。
