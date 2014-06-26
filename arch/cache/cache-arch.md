@@ -34,7 +34,7 @@ Traffic Server的管理员可以根据实际情况将存储空间组织成一系
 traffic_server进程启动的时候会根据storage.config和cache.config配置文件来计算`Cache设备`, `Cache分卷`, `Cache带`的布局和结构，因此对这些文件的修改会导致对原有cache数据的全部重新校验。
 
 #### Cache带数据结构
-Traffic Server将一个`Cache带`代表的存储区域看做一个一致性的字节集合，而在内部会对每一个`Cache带`进行独立地对待。这一节描述的数据结构对于每一个`Cache带`都是一样的。在代码中会用Vol类来代表`Cache带`, 用CacheVol来代表`Cache分卷`。
+Traffic Server将一个`Cache带`代表的存储区域看做一个一致性的字节集合，而在内部会对每一个`Cache带`进行独立地对待。这一节描述的数据结构对于每一个`Cache带`都是一样的。在代码中会用Vol类来代表`Cache带`, 用CacheVol来代表`Cache分卷`，一个`Cache分卷`由位于所有不同设备上的`Cache带`组成。
 
     在对一个对象进行操作之前必须先明确这个对象所在的`Cache带`, 因为每个`Cache带`分别拥有着独立的索引空间。
     如果缓存对象所在的`Cache带`发生变化的话那么这个缓存对象也将失效, 因为在新的`Cache带`中并没有这个缓存对象的索引。
@@ -89,4 +89,50 @@ Traffic Server将一个`Cache带`代表的存储区域看做一个一致性的�
 
 `Cache带`数据的开始位置，物理磁盘上最开始的一段数据会被保留下来，这样可以避免对操作系统造成一些干扰，这个值也代表了其他的`Cache带`在`Cache设备`上的偏移量。
 
-*start*
+**start**
+
+`Cache带`元信息之后的数据区在磁盘上的偏移量。
+
+**length**
+
+`Cache`带的字节大小，Vol::len。
+
+**data length**
+
+`Cache带`上内容区的总块数(512字节为一块)，Vol::data_blocks。
+
+    这里必须要留意代码中提到的长度和大小这些词，因为在不同的地方会分别用刀三种不同的单位(字节，cache块，存储块)。
+
+索引区的总大小(目录项的个数)的计算方法是用`Cache带`的大小除以平均对象大小来得到，索引区会消耗等量大小的内存，如果cache存储变大那么Traffic Server消耗的内存也就越多，平均对象大小默认是8000字节，可以通过`proxy.config.cache.min_average_object_size`来配置。增加平均对象大小会减少索引区对内存的占用，同时也意味着cache中能够存储的不同对象的数量也会减少。
+
+
+磁盘上的内容区域保存真正的对象数据，内容区域会被当做一个环形的缓冲区，新对象会覆盖掉最早cache下来的对象。新的缓存对象在`Cache带`中写到的位置被称为写光标，这意味着写光标到达的区域所保存的原来的对象将会被淘汰，即便这个对象还没有过期。当一个在磁盘上的对象被覆盖时，并不会立即的检测到因为索引并没有做更新，而是在后面读取对象分片的时候才会检测到失败。
+
+![cursor](https://docs.trafficserver.apache.org/en/latest/_images/ats-cache-write-cursor.png)
+
+    磁盘上的cache数据从来不会更新
+
+这是一个需要特别注意的事情，更新操作(对于收到304响应对过期对象进行刷新)实际上就是将对象的新拷贝写到写光标的位置。The originals are left as “dead” space which will be consumed when the write cursor arrives at that disk location.当`Cache带`中的索引发生更新操作时(内存中)，cache上的原有分片数据将失效，这也是比较常见的存储管理手段。当需要从cache中删除一个对象时，只需要更新一下索引即可，不需要其他的操作，特别是不需要任何的I/O操作。
+
+#### 对象数据结构
+每个对象会存储两种类型的数据，元数据和内容数据。元数据包括对象的HTTP header和描述信息，而内容数据包含对象的真正内容，发送给客户端的字节流。
+
+cache中的对象用Doc这个数据结构来表示，Doc可以认为是分片的头部数据，而且会存储在每个分片的开始位置(对象的每个分片都是一个Doc)。对象的第一个分片被称为`first Doc`并且会保存有对象的元数据，**任何对一个对象的操作都需要先读取这第一个分片**。分片的定位方法是将对象的cache key转换为cacheID然后通过这个cacheID来查找对象的目录项，目录项中保存了对象第一个分片在磁盘上的偏移量和大小，然后就会从磁盘上读取出来。对象的地一个分片会包含对象的请求头和响应头以及对象的所有描述属性(比如content length)。
+
+Traffic Server支持对象内容多样化，也称之为多副本。所有副本的全部元信息都会保存在对象的第一个分片中，包括每个副本的HTTP header信息。因此当从磁盘上读取出对象的`first Doc`之后就可以做副本选择。**如果一个对象拥有多个副本，那么每个副本会独立地分别存在其他分片中。如果对象只有一个副本，那么对象的内容有可能和元信息同时存在第一个分片中。每个副本的内容都会对应一个目录项，而每个副本目录项的查找key都会保存在第一片中的元信息中**
+
+在4.0.1版本之前，header数据会保存在CacheHTTPInfoVector这个结构中，这个结构会被序列化之后存在磁盘上，在这个结构的后面会保存和对象其他片相关的一些附加信息。
+
+![CacheHTTPInfoVector](https://docs.trafficserver.apache.org/en/latest/_images/cache-doc-layout-3-2-0.png)
+
+这样存在一个问题，如果一个对象有多个副本，那么只有一个分片table是不够的。因此在元数据中不在单独保存分片信息，而是将分片信息合并到CacheHTTPInfoVector结构中，这样就产生了下面的格式：
+
+![CacheHTTPInfoVector-4.0.1](https://docs.trafficserver.apache.org/en/latest/_images/cache-doc-layout-4-0-1.png)
+
+向量中的每一个元素代表了一个副本，包含的信息有HTTP header、分片表和一个cache key，这个cache key对应的目录项用来定位对象的earliest doc`，这也是该副本的开始分片的索引。
+
+当一个对象最开始被缓存的时候，它只会有一个副本，因此内容也会同时保存在`first Doc`中(如果内容不大的话)，在代码中称之为常驻副本，这只会在对象最初被保存的时候出现。如果元数据发生改变(比如发送If-Modified-Since请求之后接收到了304响应)，那么对象的内容数据会被保留在原始分片中，但是会用新的分片来保存对象的`first Doc`(对象内容过小的情况除外)，这样对象不会再有常驻副本，这里提到的过小是要小于配置中指定的`proxy.config.cache.alt_rewrite_max_size`的值。
+
+    CacheHTTPInfoVector只会保存在`first Doc`中，包括`earliest Doc`在内的其他Doc中的hlen的值应该是0，否则会被忽略。
+
+大对象会被切分成多个分片在cache中存储下来，
