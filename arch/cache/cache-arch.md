@@ -135,4 +135,28 @@ Traffic Server支持对象内容多样化，也称之为多副本。所有副本
 
     CacheHTTPInfoVector只会保存在`first Doc`中，包括`earliest Doc`在内的其他Doc中的hlen的值应该是0，否则会被忽略。
 
-大对象会被切分成多个分片在cache中存储下来，
+大对象会被切分成多个分片在cache中存储下来，如果文档的总长度比`first Doc`或`earliest Doc`大的话就一定是存在分片，在这种情况下会保存一个分片偏移量Table，用来保存每个分片的第一个字节相对于对象初始字节的偏移量(很显然第一个分片的偏移量总是0)。这样在对大文件处理range请求时会更加的高效，因为range请求中覆盖不到的数据分片会被忽略。序列中的最后一个分片通过接近于对象总长度的分片大小和偏移量来检测，因为没有明确的结尾标示。每个分片是通过序列中的前一片计算得出，第N片的计算公式如下：
+
+    key_for_N_plus_one = next_key(key_for_N);
+
+这里`next_key`是一个全局的函数，用来通过一个已知的cache key确定性的计算得出一个新的cache key。
+
+如果一个对象存在多个分片，那么在保存的时候会先写数据分片(包括`earliest Doc`)最后再保存`first Doc`。在从磁盘上读取时，会同时校验`first Doc`和`earliest Doc`(确保对象并没有被写光标覆盖)来确保磁盘上保存有完整的对象(这两个Doc将其他Doc夹在中间，所以如果这两个Doc有效的话，整个对象的数据就是有效的)。一个对象的所有分片是排好序的，但这些分片不一定在磁盘上市连续存储的，因为Traffic Server会交替的接收不同对象的数据。
+
+![multi-alternate](https://docs.trafficserver.apache.org/en/latest/_images/cache-multi-fragment.png)
+
+如果一个对象在cache中被标识为'pinned'的话，那么这个对象在磁盘上的数据就不可以被覆盖，因此会在写光标的位置采取疏散策略，每个分片会被读出来然后再重新写回磁盘。对于正在被疏散的对象会有一个特殊的查找机制，确保这些对象可以在内存中被找到而不是磁盘，因为此时对象在磁盘上的数据是不可靠的。The cache scans ahead of the write cursor to discover pinned objects as there is a dead zone immediately before the write cursor from which data cannot be evacuated. 待疏散的数据会先从磁盘上读取出来，然后放入写队列中等待写回磁盘。
+
+对象是否可以被'钉住'需要通过cache.config配置文件来制定，并且proxy.config.cache.permit.pinning这个配置的值不能为0(默认是0)。写光标附近的对象如果正在被使用的话，也会自动地采用同样的疏散机制，但并不是通过Dir中的pinned这个位来表示。
+
+### 其他注意事项
+Some general observations on the data structures.
+
+#### Cyclone buffer
+因为cache是循环写的，因此对象不会无限期保存在磁盘上，即使对象没有过期但仍然可能会被覆盖掉。Marking an object as pinned preserves the object through the passage of the write cursor but this is done by copying the object across the gap, in effect re-storing it in the cache. 如果被钉住的对象过大或者过多的话会导致过多的磁盘开销。最初设计为让管理员来对很小又很频繁访问的对象来设置固定属性。
+
+对象数据过期的目的是防止这些内容发送给客户端，它们并不是真正意义上的删除或清除。存储空间不会立即被回收因为写操作只会在写光标的位置发生，删除一个对象仅仅是删除这个对象在索引区的目录项，这就可以让被删除对象的文档完全失效。
+
+Cache这样设计是因为web内容相对来说都是小对象而且内容经常变化，这样设计也是为了满足高性能低延迟的需求，因为存储上很少出现分片，而且cache miss和对象的删除不需要磁盘的I/O操作，但是在大对象的存储上确实不够理想。
+
+#### 磁盘故障
