@@ -160,3 +160,114 @@ Some general observations on the data structures.
 Cache这样设计是因为web内容相对来说都是小对象而且内容经常变化，这样设计也是为了满足高性能低延迟的需求，因为存储上很少出现分片，而且cache miss和对象的删除不需要磁盘的I/O操作，但是在大对象的存储上确实不够理想。
 
 #### 磁盘故障
+cache在设计的时候考虑到在一定程度上能够容忍磁盘故障情况的发生。如果一块磁盘发生故障，那么只会造成Cache分卷在这个磁盘上的`Cache带`的数据不可用，不会影响在其他磁盘上的`Cache带`的数据。要做的主要工作中就是保证其他正常`Cache带`上的数据能够继续使用，同时要将哈希到故障磁盘上的数据分配到其他的`Cache带`中，这些工作在下面这个函数中完成：
+
+    AIO_Callback_handler::handle_disk_failure
+
+从新将一块磁盘恢复到正常工作状态有点复杂，更改一个cache key所属的`Cache带`会导致缓存中的数据不可访问，This is obviouly not a problem when a disk has failed, but is a bit trickier to decide which cached objects are to be de facto evicted if a new storage unit is added to a running system. The mechanism for this, if any, is still under investigation.
+
+
+#### 实现细节
+
+#### 索引目录项
+
+`Cache`带中的索引目录项结构定义如下：
+
+class Dir, 在P_CacheDir.h文件中定义的。
+
+`Cache带`的索引区由一组Dir对象组成，每一个目录项代表着`Cache带`上存储的一块缓存对象。因为每个对象至少要有一个索引目录项相对应，因此目录项结构的大小尽量精简。
+
+
+offset成员表示对象在`Cache带`上的开始字节位置，由40个位来表示，拆分为offset(低24字节)和offset_high(高16字节)来组成。因为每个`Cache带`都有一个索引区，因此这个offset代表的是在这个`Cache带`中的偏移量。
+
+size和big这两个成员用来计算对象分片的大概尺寸，这个只用来表示需要从offset这个偏移量处读取多少字节。分片的实际大小保存在Doc的元信息中，每当读取完之后就会得到这个值。索引这个大概尺寸至少要喝实际大小相等，也可以更大一些，但也会导致过多无用的读取。
+
+分片的大致尺寸的计算方法如下：
+
+    ( *size* + 1 ) * 2 ^ ( ``CACHE_BLOCK_SHIFT`` + 3 * *big* )
+
+这里的`CACHE_BLOCK_SHIFT`代表一个基本cache块的位长(这里会是9，也就是一个扇区的大小，512字节)。因此替换之后也就是：
+
+    ( *size* + 1 ) * 2 ^ (9 + 3 * *big*)
+
+因为big这个成员的大小是2比特位，所以系数和大小对应关系如下所示：
+
+如果size的值是0，那表示只有一个系数的大小。
+
+分片大小可以在records.config中进行设置
+
+`proxy.config.cache.target_fragment_size`
+
+这个值应该设置为一个cache目录项系数的整数倍，不一定设置为2的幂次，大的分片会提高I/O效率，但也会导致有更多的浪费。默认大小是1M，这是一个在大多数环境下都相对合理的数字，不过在某些场景下调整这个数字会得到更好的性能。 Traffic Server imposes an internal maximum of a 4194232 bytes which is 4M (2^22) less the size of a struct Doc. In practice then the largest reasonable target fragment size is 4M - 262144 = 3932160.
+
+
+When a fragment is stored to disk the size data in the cache index entry is set to the finest granularity permitted by the size of the fragment. To determine this consult the cache entry multipler table, find the smallest maximum size that is at least as large as the fragment. That will indicate the value of big selected and therefore the granularity of the approximate size. That represents the largest possible amount of wasted disk I/O when the fragment is read from disk.
+
+The set of index entries for a volume are grouped in to segments. The number of segments for an index is selected so that there are as few segments as possible such that no segment has more than 2^16 entries. Intra-segment references can therefore use a 16 bit value to refer to any other entry in the segment.
+
+Index entries in a segment are grouped buckets each of DIR_DEPTH (currently 4) entries. These are handled in the standard hash table way, giving somewhat less than 2^14 buckets per segment.
+
+#### 目录探测项
+目录项探测是指通过一个cache ID来在一个`Cache带`的索引区中查找一个指定的目录项。在程序中通过函数dir_probe()来完成，需要制定三个参数分别是：cache ID(key)，cache带和上一个冲突的项。最后一个参数即使输入又是输出，在探测期间会被修改。
+
+指定一个ID，高64位会被拿来计算属于哪个segment，通过取模运算(模上segment总数)。低64位用来计算属于哪个bucket，也是通过取模运算(模上一个segment中拥有的bucket的总数)。last_collision的值用来保存上一次匹配上的值，这个值是通过dir_probe()返回的。
+
+通过计算之后得到了对应的桶，然后从这个桶中找出一个匹配上的项，通过比较cache ID的低12位和目录项中的cache tag来检查，从目录桶中的第一项开始，然后沿着链表去查找。如果查找到一个tag匹配上的项并且之前没有其他冲突的项那么就返回这个项并且把这项赋值给last_collision，如果设置了冲突项并且不等于当前match的项那么继续沿着链表查找，如果等于那么就重置collision然后继续查找。这样设计的目的是在找到上一个冲突项之前忽略所有匹配的项，要返回之后匹配上的项。If the search falls off the end of the linked list then a miss result is returned (if no last collision), otherwise the probe is restarted after clearing the collision on the presumption that the entry for the collision has been removed from the bucket. This can lead to repeats among the returned values but guarantees that no valid entry will be skipped.
+
+上一个冲突项在一段时间之后被拿来重新发起一次目录项探测，This is important because the match returned may not be the actual object - although the hashing of the cache ID to a bucket and the tag matching is unlikely to create false positives, that is possible. When a fragment is read the full cache ID is available and checked and if wrong, that read can be discarded and the next possible match from the directory found because the cache virtual connection tracks the last collision value.
+
+#### Cache的一些操作
+当HTTP请求头被解析完并经过remap处理之后就会做一些cache操作，隧道类的事务不会对cache进行操作，因为从不解析header。
+
+这里需要介绍一下术语'cache valid'，表示一个对象可以写入到cache中（）。这很重要因为Traffic Server在一个事务处理过程中会计算cache有效性很多次，而且只会对cache有效的对象进行操作。在HTTP事务处理过程中这个标准还可能会发生改变，这是为了避免对cache无效的对象进行操作。
+
+cache的三个基本操作是查找、读取和写入。cache的删除操作仅仅是更改对应的索引项。
+
+当客户端的请求被解析完并且确认要进行cache操作，会发起cache查找。如果查找成功，那么就会发起一个cache读取的操作，如果查找失败或者读取失败，那么会发起一个cache写入的操作。
+
+#### 可缓存性
+一个请求对cache进行的第一个操作就是判断这个请求的对象是否cache有效。解析和remap工作完成之后就会进行这个判断，如果是负数那么就表示后面的cache操作会完全忽略，不会做cache的查找和写入操作。There are a number of prerequisites along with configuration options to change them. Additional cacheability checks are done later in the process when more is known about the transaction (such as plugin operations and the origin server response). Those checks are described as appropriate in the sections on the relevant operations.
+
+#### Cache查找
+如果HTTP请求被认为cache有效，那么就会发起一次cache查找。cache查找用来判断一个对象是否已经在cache中，某些情况下，cache查找用来确认对象的first Doc仍然在cache中。
+
+一次cache的查找需要三个基本步骤：
+
+1. 计算cache key
+
+一般通过请求的URL来计算，但也可以被插件中的业务逻辑覆盖掉，据我所知cache的索引字符串并不会被保存下来，因为一般假定就是通过客户端请求头来计算。
+
+2. 确定使用哪个cache带(也是通过cache key得到的)
+
+cache key会被拿来当做一个哈希key来在cache 带数组中进行查找，这个数组的构建和安排也能够体现出cache带是如何赋值的。
+
+3. cache key还会被拿来计算一下在cache带中的索引。此外，其他地方的索引也会被考虑进来，比如说agg buffer中的数据对应的索引
+
+4. 如果查找到了索引，那么会从磁盘上读取到对应的first Doc，并验证其有效性。
+
+在代码中是通过CacheVC::openReadStartHead()和CacheVC::openReadStartEarliest()这两个函数来完成。
+
+如果查找成功，那么会创建一个信息更全的结构体(OpenDir)，这里要注意的是目录探测的时候也会检查是否已经有现存的OpenDir结构体了，如果已经存在那么直接返回。
+
+#### Cache读取
+Cache读取是在cache查找成功之后发起的，此时first Doc已经加载到了内存中，可以拿来查找其它信息。在first doc中会包含对象所有副本的HTTP头信息。
+
+有了first doc中的一些信息就可以选中一个副本，这是通过比较客户端请求的信息和存储的所有副本响应头的信息而得到，不过这个也可以在插件中通过TS_HTTP_ALT_SELECT_HOOK点来做控制修改。
+
+内容通常会被拿来计算一下是否已经腐烂，这是一项重要的检查，方法是查看一下副本的header和其他元信息(选中副本之后才能做这些检查)。
+
+这个工作会在HttpTransact::what_is_document_freshness这个函数中完成。
+
+...
+
+#### Cache写入
+
+#### 更新
+
+#### Aggregation Buffer
+
+#### 疏散机制
+
+#### 疏散操作
+
+#### 初始化
