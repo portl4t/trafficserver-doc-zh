@@ -31,7 +31,7 @@ Traffic Server的管理员可以根据实际情况将存储空间组织成一系
 
 `Cache带`是cache设计实现过程中的最基本的单位。一个缓存对象会被完整的存储在单一的`Cache带`中，因此也就存储在单一的`Cache设备中`，对象从不跨`Cache设备`或跨`Cache分卷`存储。每一个对象会通过回源的URL来计算一个hash值，然后得到对应的`Cache分卷`。可以通过配置hosting.config文件来指定那些域名的数据存储在哪些`Cache分卷`中。此外，从4.0.1版本开始可以指定一个`Cache分卷`包含哪些`Cache设备`(也就指定了`Cache带`)。
 
-traffic_server进程启动的时候会根据storage.config和cache.config配置文件来计算`Cache设备`, `Cache分卷`, `Cache带`的布局和结构，因此对这些文件的修改会导致对原有cache数据的全部重新校验。
+traffic_server进程启动的时候会根据storage.config和cache.config配置文件来计算`Cache设备`, `Cache分卷`, `Cache带`的布局和结构，因此对这些文件的修改会导致原有cache数据全部失效。
 
 #### Cache带数据结构
 Traffic Server将一个`Cache带`代表的存储区域看做一个一致性的字节集合，而在内部会对每一个`Cache带`进行独立地对待。这一节描述的数据结构对于每一个`Cache带`都是一样的。在代码中会用Vol类来代表`Cache带`, 用CacheVol来代表`Cache分卷`，一个`Cache分卷`由位于所有不同设备上的`Cache带`组成。
